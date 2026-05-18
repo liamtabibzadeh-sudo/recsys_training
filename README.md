@@ -10,44 +10,40 @@ Hands-on Training for Recommender Systems developed for Machine Learning Essenti
 
 ## Installation
 
-In order to set up the necessary environment:
+Requires Python 3.11 or 3.12.
 
-1. create an environment `recsys_training` with the help of [conda],
-   
-   ```
-   conda env create -f environment.yaml
-   ```
-   
-2. activate the new environment with
-   
-   ```
-   conda activate recsys_training
-   ```
-   
-3. install `recsys_training` with:
-   
-   ```
-   python setup.py install # or develop
-   ```
+### Option A: conda (recommended)
+
+```
+conda env create -f environment.yaml
+conda activate recsys_training
+pip install -e .
+```
+
+The conda-forge build of LightFM works out of the box.
+
+### Option B: pip + venv
+
+```
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install -e .
+```
+
+If installing LightFM from PyPI fails with `AttributeError: 'dict' object has
+no attribute '__LIGHTFM_SETUP__'` (an upstream packaging bug in `lightfm==1.17`),
+run `scripts/install_lightfm.sh` — it downloads the sdist, applies a one-line
+patch, and installs it with build isolation disabled.
 
 ### Docker
 
-Make sure you have `docker` and `docker-compose` installed.
+```
+docker build -t recsys-training:mle -f docker/Dockerfile .
+docker compose -f docker/docker-compose.yaml up
+```
 
-1. Build the image with using the `Dockerfile` in `docker`
-    ```
-    docker build -t recsys-training:mle -f Dockerfile .
-    ```
-
-2. Start the container with `docker-compose` pointing to the yaml-file
-    ```
-    docker-compose up -f docker/docker-compose.yaml
-    ```
-    
-The jupyter lab port `8888` will be mapped to the same port on your host machine, simply got to your preferred browser and enter via
-    ```
-    http://localhost:8888/
-    ```
+JupyterLab is served on http://localhost:8888/.
 
 ## Usage
 
