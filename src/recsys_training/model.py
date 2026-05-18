@@ -6,230 +6,91 @@ __copyright__ = "Marcel Kurovski"
 __license__ = "mit"
 
 from collections import OrderedDict
-from copy import deepcopy
 from itertools import combinations
 import logging
 from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
-from pyfm import pylibfm
-from scipy.sparse import csr_matrix
+import scipy.sparse as sp
 
-from .utils import get_entity_sim, sigmoid, setup_logging, one_hot_encode_ids
+from .utils import get_entity_sim, sigmoid, setup_logging
 
 
 setup_logging(logging.INFO)
 _logger = logging.getLogger(__name__)
 
 
-def get_prediction(user,
-                   user_ratings: Dict[int, Dict[int, float]] = user_ratings,
-                   items: np.array = None,
-                   data: object = data,
-                   user_factors: np.array = user_factors,
-                   item_factors: np.array = item_factors,
-                   remove_known_pos: bool = True) -> Dict[int, Dict[str, float]]:
-    if items is None:
-        if remove_known_pos:
-            # Predict from unobserved items
-            known_items = np.array(list(user_ratings[user].keys()))
-            items = np.setdiff1d(data.items, known_items)
-        else:
-            items = np.array(data.items)
-    if type(items) == np.int64:
-        items = np.array([items])
-
-    user_embed = user_factors[user - 1].reshape(1, -1)
-    item_embeds = item_factors[items - 1].reshape(len(items), -1)
-
-    # use array-broadcasting
-    preds = np.sum(user_embed * item_embeds, axis=1)
-    sorting = np.argsort(preds)[::-1]
-    preds = {item: {'pred': pred} for item, pred in
-             zip(items[sorting], preds[sorting])}
-
-    return preds
-
-
-class FMRecommender(object):
+class FM(object):
     """
-    Wrapper Class for Factorization Machine from pylibfm3
+    Factorization Machine for regression, trained with row-wise SGD on the
+    squared error.
 
-    Optionally remove all test rating handling
-    Optionally hand over rating_data object to fetch everything from it
+    Prediction:
+        y_hat(x) = w0 + sum_i w_i * x_i
+                      + 0.5 * sum_f ( (sum_i v_{i,f} * x_i)^2
+                                      - sum_i v_{i,f}^2 * x_i^2 )
+
+    Drop-in replacement for `pylibfm.FM(task='regression', ...)`.
     """
-    def __init__(self,
-                 k: int,
-                 rating_data: object,
-                 user_features: pd.DataFrame = None,
-                 item_features: pd.DataFrame = None):
-        self.k = k
-        self.train_ratings = rating_data.train_ratings
-        self.test_ratings = rating_data.test_ratings
-        self.n_users = rating_data.n_users
-        self.n_items = rating_data.n_items
-        self.user_features = user_features
-        self.item_features = item_features
-        self.cf_feat = {'train': {'user': None, 'item': None},
-                        'test': {'user': None, 'item': None}}
-        self.cb_feat = deepcopy(self.cf_feat)
 
-        # Collaborative (CB == False) or Content-based?
-        if not any((self.user_features is None, self.item_features is None)):
-            self.cb = True
-        else:
-            self.cb = False
+    def __init__(self, num_factors: int = 8, num_iter: int = 10,
+                 learning_rate: float = 0.001, init_stdev: float = 0.01,
+                 seed: int = 42, verbose: bool = False):
+        self.num_factors = num_factors
+        self.num_iter = num_iter
+        self.learning_rate = learning_rate
+        self.init_stdev = init_stdev
+        self.seed = seed
+        self.verbose = verbose
 
-        if user_features is not None:
-            assert(self.n_users == len(user_features))
-        if item_features is not None:
-            assert(self.n_items == len(item_features))
+    def fit(self, X, y):
+        X = sp.csr_matrix(X)
+        y = np.asarray(y, dtype=float)
+        n_samples, n_features = X.shape
+        rng = np.random.RandomState(self.seed)
 
-        self.user_train_ratings = {}
+        self.w0_ = 0.0
+        self.w_ = np.zeros(n_features)
+        self.V_ = rng.normal(0.0, self.init_stdev, (n_features, self.num_factors))
 
-        self._setup_features()
-        self._build_train_test_ds()
-        self._build_user_train_ratings()
+        lr = self.learning_rate
+        for epoch in range(self.num_iter):
+            order = rng.permutation(n_samples)
+            for i in order:
+                start, end = X.indptr[i], X.indptr[i + 1]
+                idx = X.indices[start:end]
+                vals = X.data[start:end]
 
-        self.fm = None
+                v_sub = self.V_[idx]                 # (nnz, k)
+                vx = v_sub * vals[:, None]           # (nnz, k)
+                sum_vx = vx.sum(axis=0)              # (k,)
+                sum_vx2 = (vx * vx).sum(axis=0)      # (k,)
 
-    def _build_user_train_ratings(self):
-        grouped = self.train_ratings[['user', 'item', 'rating']].groupby('user')
-        for user in self.user_features.index.values:
-            vals = grouped.get_group(user)[['item', 'rating']].values
-            self.user_train_ratings[user] = dict(zip(vals[:, 0].astype(int),
-                                                     vals[:, 1].astype(float)))
+                linear = self.w0_ + np.dot(self.w_[idx], vals)
+                interaction = 0.5 * float((sum_vx * sum_vx - sum_vx2).sum())
+                pred = linear + interaction
 
-    def _setup_features(self):
-        # if features provided, we do CB, else: CF, if option hybrid is set, we do both
-        self.cf_feat['train']['user'] = \
-            one_hot_encode_ids(self.train_ratings.user.values - 1, self.n_users)
-        self.cf_feat['train']['item'] = \
-            one_hot_encode_ids(self.train_ratings.item.values - 1, self.n_items)
-        self.cf_feat['test']['user'] = \
-            one_hot_encode_ids(self.test_ratings.user.values - 1, self.n_users)
-        self.cf_feat['test']['item'] = \
-            one_hot_encode_ids(self.test_ratings.item.values - 1, self.n_items)
+                err = pred - y[i]
+                self.w0_ -= lr * 2.0 * err
+                self.w_[idx] -= lr * 2.0 * err * vals
+                grad_V = vals[:, None] * (sum_vx[None, :] - v_sub * vals[:, None])
+                self.V_[idx] -= lr * 2.0 * err * grad_V
 
-        if self.cb:
-            self.cb_feat['train']['user'] = \
-                self.user_features.loc[self.train_ratings.user.values].values
-            self.cb_feat['train']['item'] = \
-                self.item_features.loc[self.train_ratings.item.values].values
-            self.cb_feat['test']['user'] = \
-                self.user_features.loc[self.test_ratings.user.values].values
-            self.cb_feat['test']['item'] = \
-                self.item_features.loc[self.test_ratings.item.values].values
+            if self.verbose:
+                rmse = float(np.sqrt(np.mean((self.predict(X) - y) ** 2)))
+                print(f"Epoch {epoch + 1:02d}: train RMSE={rmse:.4f}")
+        return self
 
-    def _build_train_test_ds(self, hybrid: bool = False):
-        if hybrid:
-            assert(self.user_features is not None and self.item_features is not None)
-            self.X_train = csr_matrix(np.concatenate((self.cf_feat['train']['user'],
-                                                      self.cf_feat['train']['item'],
-                                                      self.cb_feat['train']['user'],
-                                                      self.cb_feat['train']['item']),
-                                                     axis=1))
-            self.X_test = csr_matrix(np.concatenate((self.cf_feat['test']['user'],
-                                                     self.cf_feat['test']['item'],
-                                                     self.cb_feat['test']['user'],
-                                                     self.cb_feat['test']['item']),
-                                                    axis=1))
-        else:
-            if self.cb:
-                self.X_train = csr_matrix(np.concatenate((self.cb_feat['train']['user'],
-                                                          self.cb_feat['train']['item']),
-                                                         axis=1))
-                self.X_test = csr_matrix(np.concatenate((self.cb_feat['test']['user'],
-                                                         self.cb_feat['test']['item']),
-                                                        axis=1))
-            else:
-                self.X_train = csr_matrix(np.concatenate((self.cf_feat['train']['user'],
-                                                          self.cf_feat['train']['item']),
-                                                         axis=1))
-                self.X_test = csr_matrix(np.concatenate((self.cf_feat['test']['user'],
-                                                         self.cf_feat['test']['item']),
-                                                        axis=1))
-
-        self.y_train = self.train_ratings.rating.values.astype(float)
-        self.y_test = self.test_ratings.rating.values.astype(float)
-
-    def train(self, n_epochs: int, learning_rate: float = 0.001,
-              random_seed: int = 42, hybrid: bool = False, verbose: bool = True):
-        self._build_train_test_ds(hybrid)
-        self.fm = pylibfm.FM(num_factors=self.k,
-                             num_iter=n_epochs,
-                             verbose=verbose,
-                             task='regression',
-                             initial_learning_rate=learning_rate,
-                             seed=random_seed)
-        self.fm.fit(self.X_train, self.y_train)
-
-    def _get_design_matrix(self, user: int, hybrid: bool = False) -> csr_matrix:
-        if hybrid:
-            single_user_cf_feat = np.zeros((self.n_items, self.n_users))
-            single_user_cf_feat[:, user - 1] = 1
-            all_items_cf_feat = np.eye(self.n_items)
-
-            single_user_cb_feat = self.user_features.loc[user].values.reshape(1, -1)
-            single_user_cb_feat = single_user_cb_feat.repeat(self.n_items, axis=0)
-            all_items_cb_feat = self.item_features.values
-
-            features = [single_user_cf_feat, all_items_cf_feat,
-                        single_user_cb_feat, all_items_cb_feat]
-
-        else:
-            if self.cb:
-                single_user_cb_feat = self.user_features.loc[user].values.reshape(1, -1)
-                single_user_cb_feat = single_user_cb_feat.repeat(self.n_items, axis=0)
-                all_items_cb_feat = self.item_features.values
-
-                features = [single_user_cb_feat, all_items_cb_feat]
-
-            else:
-                single_user_cf_feat = np.zeros((self.n_items, self.n_users))
-                single_user_cf_feat[:, user - 1] = 1
-                all_items_cf_feat = np.eye(self.n_items)
-
-                features = [single_user_cf_feat, all_items_cf_feat]
-
-        return csr_matrix(np.concatenate(features, axis=1))
-
-    def get_prediction(self, user: int, hybrid: bool = False) -> Dict[int, Dict[str, float]]:
-        X = self._get_design_matrix(user, hybrid=hybrid)
-
-        preds = self.fm.predict(X)
-        sorting = np.argsort(preds)[::-1]
-        items = self.item_features.index.values
-        preds = {item: {'pred': pred} for item, pred in
-                 zip(items[sorting], preds[sorting])}
-
-        return preds
-
-    def get_recommendations(self, user: int, N: int, hybrid: bool = False,
-                            remove_known_pos: bool = True):
-        known_items = []
-        if remove_known_pos:
-            known_items = list(self.user_train_ratings[user].keys())
-        predictions = self.get_prediction(user, hybrid)
-
-        recommendations = []
-        for item, pred in predictions.items():
-            if item not in known_items:
-                add_item = (item, pred)
-                recommendations.append(add_item)
-            if len(recommendations) == N:
-                break
-
-        return recommendations
-
-    def rating_score(self):
-        return None
-        # remove_known_pos
+    def predict(self, X) -> np.ndarray:
+        X = sp.csr_matrix(X)
+        linear = self.w0_ + np.asarray(X @ self.w_).ravel()
+        XV = X @ self.V_
+        X2V2 = X.multiply(X) @ (self.V_ * self.V_)
+        interaction = 0.5 * np.asarray(XV * XV - X2V2).sum(axis=1)
+        return np.asarray(linear + interaction).ravel()
 
 
-# TODO: Implement biases
-# TODO: Implement Adaptive Learning Rate, e.g. Adam Optimizer
 class BPRRecommender(object):
     def __init__(self, ratings: pd.DataFrame, users: np.array, items: np.array,
                  k: int, N: int, seed: int = 42):
