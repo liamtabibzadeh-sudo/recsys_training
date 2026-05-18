@@ -140,12 +140,13 @@ def preprocess_items(items: pd.DataFrame) -> pd.DataFrame:
 
 def get_user_profiles(ratings: pd.DataFrame, prep_items: pd.DataFrame) -> pd.DataFrame:
     min_rating = 4
-    ratings = ratings[ratings.rating >= min_rating]
-    ratings.drop(['rating', 'timestamp'], axis=1, inplace=True)
+    ratings = ratings.loc[ratings.rating >= min_rating].drop(
+        columns=['rating', 'timestamp']
+    )
     ratings = ratings.merge(prep_items, on='item', how='left')
-    ratings.drop(['item', 'release_month'], axis=1, inplace=True)
+    ratings = ratings.drop(columns=['item', 'release_month'])
     grouped = ratings.groupby('user')
-    profiles = grouped.apply(user_profiler).reset_index()
+    profiles = grouped.apply(user_profiler, include_groups=False).reset_index()
     profiles.rename(columns={'50%': 'median'}, inplace=True)
 
     return profiles
